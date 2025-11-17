@@ -111,7 +111,7 @@ def html_kpi(label, value, delta=None, delta_color="neutral"):
 # ----------------------------------------------------
 @st.cache_data
 def load_data():
-    df = pd.read_csv(r"C:\ASSIGNMENTS\ANgel MRP\bitext_customer_support.csv")
+    df = pd.read_csv(r"bitext_customer_support.csv")
     df = df.dropna(subset=["instruction", "intent"])
     df = df.drop_duplicates(subset=["instruction"])
 
@@ -135,8 +135,8 @@ def load_data():
 
 @st.cache_resource
 def load_models():
-    clf = joblib.load(r"C:\ASSIGNMENTS\ANgel MRP\intent_classifier.pkl")
-    vec = joblib.load(r"C:\ASSIGNMENTS\ANgel MRP\tfidf_vectorizer.pkl")
+    clf = joblib.load(r"intent_classifier.pkl")
+    vec = joblib.load(r"tfidf_vectorizer.pkl")
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
     generator = pipeline(
         "text-generation",
@@ -701,3 +701,4 @@ with tab_insights:
 
     for rec in insights["recommendations"]:
         st.markdown(f"- {rec}")
+
