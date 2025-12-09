@@ -16,3 +16,4 @@ huggingface-hub
 # WordCloud + Tools
 wordcloud
 scipy
+groq
