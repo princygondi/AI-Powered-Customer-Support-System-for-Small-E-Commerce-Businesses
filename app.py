@@ -1,4 +1,4 @@
-# app.py — AI Customer Support Assistant & Insights Dashboard
+# app.py — AI Customer Support Assistant & Insights Dashboard (Groq hybrid)
 
 import streamlit as st
 import pandas as pd
@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import pipeline
+from groq import Groq
 
 # ----------------------------------------------------
 # PAGE CONFIG
@@ -111,8 +112,8 @@ def html_kpi(label, value, delta=None, delta_color="neutral"):
 # ----------------------------------------------------
 @st.cache_data
 def load_data():
-    # Use your local CSV path
-    df = pd.read_csv(r"bitext_customer_support.csv")
+    # Use relative path so it works locally + on Streamlit Cloud
+    df = pd.read_csv("bitext_customer_support.csv")
     df = df.dropna(subset=["instruction", "intent"])
     df = df.drop_duplicates(subset=["instruction"])
 
@@ -135,42 +136,25 @@ def load_data():
 
 
 @st.cache_resource
-@st.cache_resource
 def load_models():
-    clf = joblib.load(r"intent_classifier.pkl")
-    vec = joblib.load(r"tfidf_vectorizer.pkl")
+    # intent classifier + vectorizer
+    clf = joblib.load("intent_classifier.pkl")
+    vec = joblib.load("tfidf_vectorizer.pkl")
 
-    # Small talk model
+    # small-talk encoder
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-    # ---- FIXED PART ----
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    qwen_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="auto",
-        device_map="cpu"  # runs on CPU
-    )
-
-    generator = pipeline(
-        "text-generation",
-        model=qwen_model,
-        tokenizer=tokenizer,
-        max_new_tokens=80,
-        temperature=0.0,      # deterministic
-        do_sample=False,      # no random sampling
-        pad_token_id=tokenizer.eos_token_id
-    )
-
+    # sentiment analyzer (for dashboard)
     sentiment = pipeline("sentiment-analysis")
 
-    return clf, vec, embedder, generator, sentiment
+    # Groq client (for smart mode)
+    groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+    return clf, vec, embedder, sentiment, groq_client
+
 
 data = load_data()
-model, tfidf, embedder, generator, sentiment_analyzer = load_models()
+model, tfidf, embedder, sentiment_analyzer, groq_client = load_models()
 
 # ----------------------------------------------------
 # SMALL TALK
@@ -260,60 +244,76 @@ def build_conversation_context(max_turns: int = 3) -> str:
     return "\n".join(lines)
 
 # ----------------------------------------------------
+# GROQ / LLaMA-3 GENERATION HELPER
+# ----------------------------------------------------
+def generate_groq_reply(prompt: str, tone: str) -> str:
+    """
+    Call Groq LLaMA-3 via chat completion with a short, safe config.
+    """
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a customer support assistant for a small online shop. "
+                        f"Use a {tone} tone. Follow the user's instructions exactly. "
+                        "Use 3–5 short lines, no long paragraphs, no fictional details, "
+                        "no internal process talk."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.2,
+            max_tokens=180,
+            top_p=0.9,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return ""
+
+# ----------------------------------------------------
 # STRUCTURE / CLEAN HELPERS
 # ----------------------------------------------------
-def build_paraphrase_prompt(base, tone, context):
-    return f"""
-You are a customer support chatbot for a small online shop.
-
-Rewrite the message below into a clean, concise reply (3–6 short lines).  
-Rules:
-- No placeholders like {{order}}, {{email}}, {{phone}}. Replace with "your order" or "your account".
-- No dramatic words ("decoded", "restitution", "sensing", etc.).
-- No made-up content or assumptions.
-- No marketing language.
-- NO long paragraphs.
-- NO repeating lines.
-- Keep tone: {tone}.
-- If base message is unclear, rewrite it into the simplest helpful version.
-- Use plain human language.
-- If context clarifies user intent, adjust wording accordingly.
-
-Conversation context:
-{context}
-
-Message to rewrite:
-\"\"\"{base}\"\"\"
-
-Final rewritten message:
-"""
+def build_paraphrase_prompt(base, context):
+    """
+    Prompt for rewriting the template answer with context.
+    """
+    ctx_block = f"Conversation so far:\n{context}\n\n" if context else ""
+    return (
+        f"{ctx_block}"
+        "Rewrite the following customer support reply so that it is:\n"
+        "- clear and specific\n"
+        "- 3–5 short lines\n"
+        "- focused only on what the customer needs to do next\n"
+        "- no examples, no role-play, no extra commentary\n\n"
+        f"Original reply:\n\"\"\"{base}\"\"\"\n\n"
+        "New reply (just the message you would send to the customer):"
+    )
 
 
-def clean_generated_reply(text, prompt=None):
-    # Remove prompt echo
-    if prompt and text.startswith(prompt):
-        text = text[len(prompt):].strip()
+def clean_generated_reply(text):
+    # Remove junk URLs and irrelevant pieces
+    text = re.sub(r"http[s]?://\S+", "", text)
+    text = re.sub(r"(?i)(affiliate|reddit|post was submitted|HR office|IRC)", "", text)
 
-    # Remove unwanted boilerplate
-    text = re.sub(r"[\[\(].*?[\]\)]", "", text)  # remove brackets like [insert...]
-    text = re.sub(r"(affiliate|reddit|post was submitted|api key|irc)", "", text, flags=re.I)
-    text = re.sub(r"\byour order\s+your order\b", "your order", flags=re.I)
-    text = re.sub(r"[^A-Za-z0-9.,?!\n ]", " ", text)
-
-    # Normalize sentence breaks
-    text = re.sub(r"\s{2,}", " ", text).strip()
-
-    # Remove repeated lines
-    lines = []
+    # Split into sentences and remove duplicates
+    parts = [p.strip() for p in re.split(r"[\.!\?]\s+", text) if p.strip()]
+    uniq = []
     seen = set()
-    for line in text.split("\n"):
-        l = line.strip()
-        if l and l.lower() not in seen:
-            lines.append(l)
-            seen.add(l.lower())
+    for p in parts:
+        pl = p.lower()
+        if pl not in seen:
+            uniq.append(p)
+            seen.add(pl)
 
-    return "\n".join(lines).strip()
-    
+    cleaned = ". ".join(uniq)
+    return cleaned.strip()
+
 
 def safe_reply(text: str) -> str:
     banned = ["amazon", "reddit", "affiliate", "post was submitted"]
@@ -328,26 +328,17 @@ def safe_reply(text: str) -> str:
 
 
 def enforce_formatting(reply: str, intent: str) -> str:
-    # Extract sentences
-    sentences = [
-        s.strip()
-        for s in re.split(r"[.!?]\s+", reply)
-        if len(s.strip()) > 2
-    ][:5]
+    sentences = [s.strip() for s in re.split(r"[\.!\?]\s+", reply) if len(s.strip()) > 2]
 
-    if not sentences:
-        return reply
-
-    # Refund → bullets
+    # Refund-related intents → bullet list
     if "refund" in intent:
-        return "\n".join(f"- {s}" for s in sentences)
+        return "\n".join(f"- {s}" for s in sentences[:5])
 
-    # Password, tracking, order changes → steps
-    if any(x in intent for x in ["recover", "track", "change", "cancel"]):
-        return "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
+    # Step-by-step actions (orders, delivery, password, track)
+    if any(k in intent for k in ["track", "cancel", "change", "recover", "delivery"]):
+        return "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences[:5]))
 
-    # Otherwise → clean short reply
-    return "\n".join(sentences)
+    return reply
 
 
 def clean_template_reply(text: str) -> str:
@@ -357,11 +348,10 @@ def clean_template_reply(text: str) -> str:
     - fix 'your order your order' style double phrases
     - keep it simple and neutral
     """
-    # Replace the most common placeholders explicitly
     text = re.sub(r"\{\{Order Number\}\}", "your order number", text)
-    text = re.sub(r"\{\{.*?\}\}", "your order", text)  # fallback for other placeholders
+    text = re.sub(r"\{\{.*?\}\}", "your order", text)  # fallback
 
-    # Fix ugly repetitions like "your order your order"
+    # Fix ugly repetitions
     text = re.sub(r"\byour order\s+your order\b", "your order", text, flags=re.IGNORECASE)
     text = re.sub(
         r"\bpurchase with the number your order\b",
@@ -370,7 +360,6 @@ def clean_template_reply(text: str) -> str:
         flags=re.IGNORECASE
     )
 
-    # Strip overly dramatic or weird wording
     bad_phrases = [
         "I've decoded that",
         "I'm sensing that",
@@ -381,71 +370,76 @@ def clean_template_reply(text: str) -> str:
     for p in bad_phrases:
         text = text.replace(p, "")
 
-    # Normalize spaces
     text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
 # ----------------------------------------------------
-# HYBRID REPLY (INTENT + TEMPLATE + PHI-3 MINI)
+# HYBRID REPLY (INTENT + TEMPLATE + optional Groq LLaMA-3)
 # ----------------------------------------------------
-def generate_hybrid_reply(user_query: str):
+def generate_hybrid_reply(user_query: str, mode: str):
     """
-    Main improved hybrid chatbot:
-    - small talk
-    - intent prediction
-    - category override
-    - context-aware template selection
-    - strict Qwen rewriting
-    - formatting (bullets/steps)
-    - fallback cleaning
-    - agent handoff logic
+    Main reply generator:
+    - detect smalltalk
+    - classify intent
+    - adjust based on category buttons
+    - use dataset template
+    - (FAST mode) → template only
+    - (SMART mode) → paraphrase with Groq LLaMA-3
     """
 
-    # ---------- 0. Small talk ----------
+    smart_mode = mode.startswith("🤖")
+
+    # 0. Small talk (hi / thanks / bye)
     st_tag = detect_smalltalk(user_query)
     if st_tag:
         reply = smalltalk_reply(st_tag)
         return reply, "smalltalk", None
 
-    # ---------- 1. Predict intent ----------
+    # 1. Predict intent
     intent, confidence = predict_intent(user_query)
 
-    # ---------- 1.1 Category lock ----------
+    # 1.1 category lock (if user clicked one of the buttons)
     category = st.session_state.get("issue_category")
     if category:
-        if category == "payments":
-            intent = "payment_issue"
-        elif category == "delivery":
-            intent = "track_order"
-        elif category == "orders":
-            intent = "place_order"
-        elif category == "account":
-            intent = "recover_password"
-        elif category == "other":
-            intent = intent  # keep original
+        if category == "payments" and "refund" in intent:
+            pass
+        elif category == "delivery" and "track" in intent:
+            pass
+        elif category == "orders" and ("order" in intent or "change" in intent):
+            pass
+        elif category == "account" and ("recover" in intent or "edit" in intent):
+            pass
+        else:
+            if category == "payments":
+                intent = "payment_issue"
+            elif category == "delivery":
+                intent = "track_order"
+            elif category == "orders":
+                intent = "place_order"
+            elif category == "account":
+                intent = "recover_password"
 
-    # ---------- 1.2 Agent handoff ----------
+    # 1.2 Special: "talk to agent"
     agent_pending = st.session_state.get("agent_pending_issue", False)
     if intent == "contact_human_agent":
         if not agent_pending:
-            # We first need the user to describe the issue
             st.session_state["agent_pending_issue"] = True
             reply = (
-                "I can connect you to a human agent.\n"
-                "Before I do, please tell me briefly what you need help with "
-                "(order, delivery, payment, account, or something else)."
+                "I can help connect you to a human agent.\n"
+                "- Before I do, please tell me in one or two sentences what you need help with "
+                "(for example: order, delivery, payment, account, or something else).\n"
+                "- After you describe the issue, I’ll route you to a representative."
             )
             return reply, intent, confidence
         else:
-            # User already described issue → handoff completed
             st.session_state["agent_pending_issue"] = False
             reply = (
-                "Thank you for clarifying.\n"
-                "I'm now handing this over to a human agent who can assist you further."
+                "Thank you for explaining your issue.\n"
+                "I'll now pass this conversation to a human agent so they can help you further."
             )
             return reply, intent, confidence
 
-    # ---------- 2. Select template from dataset ----------
+    # 2. Get template from dataset
     subset = data[data["intent"] == intent]
     if not subset.empty:
         base = subset["response"].sample(1, random_state=42).values[0]
@@ -455,53 +449,41 @@ def generate_hybrid_reply(user_query: str):
             "Could you share a bit more detail?"
         )
 
-    # ---------- 3. Clean template ----------
+    # 3. Clean the template
     base = clean_template_reply(base)
 
-    # ---------- 4. Context-based overrides ----------
-    # Look at recent conversation to "fix" wrong template meaning
-    last_messages = [msg for role, msg in st.session_state.get("chat_history", []) if role == "user"]
-    last_user = last_messages[-1].lower() if last_messages else ""
+    # 4. If FAST mode → don't call LLM at all
+    if not smart_mode:
+        reply = enforce_formatting(base, intent)
+        reply = safe_reply(reply)
+        return reply.strip(), intent, confidence
 
-    if "damaged" in user_query.lower() and "refund" in user_query.lower():
-        base = "Let me help you with a refund for a damaged item."
-    if "change" in user_query.lower() and "payment" in user_query.lower():
-        base = "You want to update your payment method. Here’s how."
-    if "track" in user_query.lower() and "order" in user_query.lower():
-        base = "Here’s how you can see the current status and tracking updates for your order."
-    if "password" in user_query.lower() or "login" in user_query.lower():
-        base = "Let me help you reset access to your account."
-
-    # ---------- 5. Build rewriting prompt ----------
+    # 5. SMART mode → build context + tone + Groq prompt
     context = build_conversation_context(max_turns=3)
     tone = detect_tone_from_text(user_query)
-    prompt = build_paraphrase_prompt(base, tone, context)
+    prompt = build_paraphrase_prompt(base, context)
 
-    # ---------- 6. LLM REWRITE ----------
-    try:
-        gen = generator(prompt)
-        raw = gen[0]["generated_text"]
+    raw = generate_groq_reply(prompt, tone)
 
-        # Remove prompt echo
-        if raw.startswith(prompt):
-            raw = raw[len(prompt):].strip()
+    # 6. If Groq fails or too short → fall back to template
+    if not raw or len(raw) < 15:
+        reply = enforce_formatting(base, intent)
+        reply = safe_reply(reply)
+        return reply, intent, confidence
 
-        rewritten = clean_generated_reply(raw, prompt)
+    # 7. Clean output
+    reply = clean_generated_reply(raw)
 
-    except Exception:
-        rewritten = base  # fallback
+    if not reply or len(reply) < 15:
+        reply = base
 
-    # ---------- 7. Fallback if blank/too short ----------
-    if not rewritten or len(rewritten.split()) < 4:
-        rewritten = base
+    # 8. Apply formatting rules
+    reply = enforce_formatting(reply, intent)
 
-    # ---------- 8. Apply formatting based on intent ----------
-    final = enforce_formatting(rewritten, intent)
+    # 9. Last safety pass
+    reply = safe_reply(reply)
 
-    # ---------- 9. Final safety cleaning ----------
-    final = safe_reply(final)
-
-    return final.strip(), intent, confidence
+    return reply.strip(), intent, confidence
 
 # ----------------------------------------------------
 # ANALYTICS HELPERS
@@ -578,7 +560,7 @@ def compute_business_insights(df):
     # Top issues this week
     top_issues = this_week["intent"].value_counts().head(3)
 
-    # Pattern-based masks (not hard-coded mapping)
+    # Pattern-based masks
     refund_mask = df["intent"].str.contains("refund", case=False, regex=True)
     delivery_mask = df["intent"].str.contains("delivery|track_order|shipping", case=False, regex=True)
 
@@ -637,7 +619,7 @@ def compute_business_insights(df):
     else:
         summary = " ".join(summary_parts)
 
-    # Recommendations (simple rules)
+    # Recommendations
     recs = []
     if refund_delta > 15:
         recs.append(
@@ -664,7 +646,6 @@ def compute_business_insights(df):
     if not recs:
         recs.append("Keep monitoring ticket volumes and sentiment. Current patterns look stable.")
 
-    # Weekly report subset for export
     weekly_export = this_week.copy()
 
     return {
@@ -690,7 +671,7 @@ st.sidebar.markdown(
 This app shows a prototype of:
 
 - Intent classification (ML)
-- Hybrid response generation (templates + Qwen2.5-1.5B-Instruct)
+- Hybrid response generation (templates + Groq LLaMA-3)
 - Small talk detection
 - Analytics & business insights for small e-commerce
 """
@@ -698,6 +679,13 @@ This app shows a prototype of:
 st.sidebar.markdown("---")
 st.sidebar.write("Tickets in dataset:", len(data))
 st.sidebar.write("Unique intents:", data["intent"].nunique())
+
+# Response mode toggle
+response_mode = st.sidebar.radio(
+    "Response mode",
+    ["⚡ Fast (templates only)", "🤖 Smart (Groq LLaMA-3)"],
+    index=0
+)
 
 # ----------------------------------------------------
 # TABS
@@ -722,7 +710,7 @@ with tab_chat:
     if "chat_active" not in st.session_state:
         st.session_state.chat_active = True
 
-    # END CHAT BUTTON
+    # END CHAT / NEW CHAT BUTTONS
     end_col, start_col = st.columns([1, 1])
 
     with end_col:
@@ -752,7 +740,7 @@ with tab_chat:
                 st.markdown(msg)
         st.stop()
 
-    # --- Issue category quick buttons (always visible) ---
+    # --- Issue category quick buttons ---
     st.markdown("#### Common topics")
 
     bc1, bc2, bc3, bc4, bc5 = st.columns(5)
@@ -763,7 +751,7 @@ with tab_chat:
 
     with bc1:
         if st.button("👤 Account"):
-            set_category("account", "Sure — let's work on your account or login issue. What exactly is happening?")
+            set_category("account", "Okay, let's look at your account or login issue. Please tell me what's going wrong.")
     with bc2:
         if st.button("🧾 Orders"):
             set_category("orders", "Got it — this is about an order. How can I help with your order?")
@@ -772,7 +760,7 @@ with tab_chat:
             set_category("delivery", "Okay — sounds like a delivery or tracking issue. What's happening with your delivery?")
     with bc4:
         if st.button("💳 Payments"):
-            set_category("payments", "Understood — we’re looking at a payment or refund issue. Tell me what you’d like to update or fix.")
+            set_category("payments", "Understood — we're looking at a payment or refund issue. Tell me what you'd like to update or fix.")
     with bc5:
         if st.button("❓ Other"):
             set_category("other", "No problem — tell me briefly what you'd like help with.")
@@ -796,7 +784,8 @@ with tab_chat:
         with st.chat_message("assistant"):
             with st.spinner("Regenerating..."):
                 reply, intent, confidence = generate_hybrid_reply(
-                    st.session_state.last_user_message
+                    st.session_state.last_user_message,
+                    response_mode
                 )
                 st.session_state.chat_history.append(("assistant", reply))
                 st.markdown(reply)
@@ -818,7 +807,10 @@ with tab_chat:
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                reply, intent, confidence = generate_hybrid_reply(user_input)
+                reply, intent, confidence = generate_hybrid_reply(
+                    user_input,
+                    response_mode
+                )
                 st.session_state.chat_history.append(("assistant", reply))
                 st.markdown(reply)
 
@@ -958,4 +950,3 @@ with tab_insights:
 
     for rec in insights["recommendations"]:
         st.markdown(f"- {rec}")
-
